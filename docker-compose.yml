@@ -31,6 +31,12 @@ services:
     volumes:
       - pr-af-workspaces:/workspaces
       - opencode-data:/home/praf/.local/share
+      # Bind-mount the workflow-written .env so PR-AF's
+      # load_dotenv(_project_root / ".env") (app.py:24) actually finds it.
+      # Without this, /app/.env doesn't exist in the container and the only
+      # way to pass config to PR-AF is via the service's `environment:` block,
+      # which means every new var needs a docker-compose.override.yml update.
+      - ./.env:/app/.env:ro
     depends_on:
       agentfield:
         condition: service_started
