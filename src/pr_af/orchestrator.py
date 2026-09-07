@@ -520,6 +520,39 @@ class ReviewOrchestrator:
             all_dimensions.sort(key=lambda d: d.priority, reverse=True)
             all_dimensions = all_dimensions[: depth_profile.max_dimensions]
 
+        # Hint-driven dimension. ReviewInput.hints was previously dead code:
+        # the pipeline routes through _run_meta_selectors (not planning_phase,
+        # the original hints consumer), so hints never reached any prompt.
+        # Honor them here: force-append ONE dimension carrying the hint text,
+        # AFTER the depth cap so it can never be dropped by prioritization.
+        if self.config.hints:
+            hints_text = "\n".join(f"- {h}" for h in self.config.hints)
+            all_dimensions.append(
+                ReviewDimension(
+                    id="hint_driven",
+                    name="Hint-driven review",
+                    review_prompt=(
+                        "You are performing a focused review driven by "
+                        "project-specific hints supplied by the requesting "
+                        "repository. These hints carry the repository's "
+                        "PERMANENT review policy — follow them exactly.\n\n"
+                        "## Project-specific review hints\n\n"
+                        f"{hints_text}\n\n"
+                        "Read the actual code before reporting. If a hint "
+                        "asks for an inventory (e.g. of design decisions), "
+                        "produce it faithfully and completely — do not "
+                        "summarize it away."
+                    ),
+                    target_files=[f.path for f in anatomy.files],
+                    priority=10,
+                )
+            )
+            print(
+                f"[PR-AF] Hint-driven dimension appended "
+                f"({len(self.config.hints)} hint(s), exempt from depth cap)",
+                flush=True,
+            )
+
         print(
             f"[PR-AF] Meta-selectors: "
             f"{' + '.join(f'{m.lens}({len(m.dimensions)})' for m in meta_results)} "
