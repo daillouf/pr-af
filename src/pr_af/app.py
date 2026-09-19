@@ -46,6 +46,17 @@ app = Agent(
         model=_ai_config.ai_model,
         api_key=os.getenv("OPENROUTER_API_KEY", ""),
         api_base=os.getenv("PR_AF_AI_API_BASE", "https://openrouter.ai/api/v1"),
+        # opencode.ai/zen/go/v1 now requires an x-opencode-session header on
+        # every chat completion (route optimization; without it the gateway
+        # rejects the request with MissingSessionID before it ever reaches the
+        # model — observed as LiteLLM silently returning nothing, so .ai()
+        # gets {} and Pydantic fails on missing fields). Any non-empty value
+        # is accepted; the session id scopes the request for gateway routing.
+        litellm_params={
+            "extra_headers": {
+                "x-opencode-session": os.getenv("PR_AF_OPENCODE_SESSION", "pr-af-review"),
+            }
+        },
     ),
 )
 
