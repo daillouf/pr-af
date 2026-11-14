@@ -76,6 +76,82 @@ func TestPostReview_OwnPR422FallsBackToComment(t *testing.T) {
 	}
 }
 
+// scriptedGH answers PostReview with the scripted errors in order (nil = created).
+type scriptedGH struct {
+	ownPRFallbackGH
+	outcomes []error
+}
+
+func (g *scriptedGH) PostReview(_ context.Context, _ string, _ string, _ int, review schemas.GitHubReview, _ string) (map[string]any, error) {
+	g.reviews = append(g.reviews, review)
+	if err := g.outcomes[len(g.reviews)-1]; err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": 1}, nil
+}
+
+func scriptedOrch(outcomes ...error) (*Orchestrator, *scriptedGH) {
+	gh := &scriptedGH{outcomes: outcomes}
+	o := New(Deps{App: &fakeApp{}, GH: gh}, schemas.ReviewInput{}, config.DefaultReviewConfig())
+	o.prData = &schemas.GitHubPRData{Owner: "o", Repo: "r", Number: 7, HeadSHA: "sha"}
+	return o, gh
+}
+
+var twoComments = []schemas.GitHubComment{
+	{Path: "a.go", Line: 3, Side: "RIGHT", Body: "first finding"},
+	{Path: "docs/x.md", Line: 9, Side: "RIGHT", Body: "second finding"},
+}
+
+func TestPostReview_UnresolvedLine422RetriesWithoutInlineComments(t *testing.T) {
+	lineErr := &github.APIError{StatusCode: 422, Body: `{"errors":["Line could not be resolved"]}`}
+	o, gh := scriptedOrch(lineErr, nil)
+
+	posted := o.postReview(context.Background(), schemas.GitHubReview{Body: "summary", Event: "COMMENT", Comments: twoComments}, "summary", twoComments)
+
+	if !posted || len(gh.reviews) != 2 {
+		t.Fatalf("posted=%v calls=%d, want true and 2", posted, len(gh.reviews))
+	}
+	retry := gh.reviews[1]
+	if len(retry.Comments) != 0 {
+		t.Errorf("retry kept %d inline comments, want 0", len(retry.Comments))
+	}
+	for _, want := range []string{"`a.go:3`", "first finding", "`docs/x.md:9`", "second finding"} {
+		if !strings.Contains(retry.Body, want) {
+			t.Errorf("retry body lacks %q", want)
+		}
+	}
+}
+
+func TestPostReview_FailedRetryReportsNotPosted(t *testing.T) {
+	lineErr := &github.APIError{StatusCode: 422, Body: "Line could not be resolved"}
+	o, gh := scriptedOrch(lineErr, &github.APIError{StatusCode: 422, Body: "still refused"})
+
+	if o.postReview(context.Background(), schemas.GitHubReview{Body: "s", Event: "COMMENT", Comments: twoComments}, "s", twoComments) {
+		t.Fatal("postReview = true, want false")
+	}
+	if len(gh.reviews) != 2 {
+		t.Errorf("calls = %d, want 2", len(gh.reviews))
+	}
+}
+
+func TestPostReview_Non422IsNotRetried(t *testing.T) {
+	o, gh := scriptedOrch(&github.APIError{StatusCode: 403, Body: "forbidden"})
+
+	if o.postReview(context.Background(), schemas.GitHubReview{Body: "s", Event: "COMMENT", Comments: twoComments}, "s", twoComments) {
+		t.Fatal("postReview = true, want false")
+	}
+	if len(gh.reviews) != 1 {
+		t.Errorf("calls = %d, want 1", len(gh.reviews))
+	}
+}
+
+func TestReviewWithoutInlineCommentsStaysUnderGitHubsLimit(t *testing.T) {
+	huge := schemas.GitHubReview{Body: "s", Event: "COMMENT", Comments: []schemas.GitHubComment{{Path: "a.go", Line: 1, Body: strings.Repeat("é", 100000)}}}
+	if got := len([]rune(reviewWithoutInlineComments(huge).Body)); got >= 65536 {
+		t.Errorf("body = %d chars, want under 65536", got)
+	}
+}
+
 func equalComments(a, b []schemas.GitHubComment) bool {
 	if len(a) != len(b) {
 		return false

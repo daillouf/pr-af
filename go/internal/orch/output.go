@@ -118,7 +118,10 @@ func (o *Orchestrator) generateOutput(
 	}
 
 	if postToGitHub && !o.input.DryRun && strp(o.input.PrURL) != "" {
-		o.postReview(ctx, review, summaryBody, comments)
+		if !o.postReview(ctx, review, summaryBody, comments) {
+			// The run still ends complete: name the failure on a line a CI step can grep.
+			fmt.Println("[PR-AF] REVIEW_NOT_POSTED: no review was created on GitHub")
+		}
 	}
 
 	bySeverity := map[string]int{}
@@ -188,22 +191,58 @@ func (o *Orchestrator) generateOutput(
 	}, nil
 }
 
-// postReview posts the review, downgrading a 422 "own pull request" REQUEST_
-// CHANGES to a COMMENT and retrying once (orchestrator.py's httpx handling).
-func (o *Orchestrator) postReview(ctx context.Context, review schemas.GitHubReview, summaryBody string, comments []schemas.GitHubComment) {
-	_, err := o.deps.GH.PostReview(ctx, o.prData.Owner, o.prData.Repo, o.prData.Number, review, o.prData.HeadSHA)
-	if err == nil {
-		return
+// maxReviewBodyChars keeps the review body under GitHub's 65,536-character limit.
+const maxReviewBodyChars = 60000
+
+// reviewWithoutInlineComments is the same review with its inline comments
+// written into the body, one path:line entry each. The fallback when GitHub
+// refuses a review because a comment targets a line outside the diff.
+func reviewWithoutInlineComments(review schemas.GitHubReview) schemas.GitHubReview {
+	entries := make([]string, len(review.Comments))
+	for i, c := range review.Comments {
+		entries[i] = fmt.Sprintf("- `%s:%d`\n\n%s", c.Path, c.Line, c.Body)
 	}
-	var apiErr *github.APIError
-	if errors.As(err, &apiErr) && apiErr.StatusCode == 422 && strings.Contains(strings.ToLower(apiErr.Body), "own pull request") {
-		fallback := schemas.GitHubReview{Body: summaryBody, Event: "COMMENT", Comments: comments}
-		if _, retryErr := o.deps.GH.PostReview(ctx, o.prData.Owner, o.prData.Repo, o.prData.Number, fallback, o.prData.HeadSHA); retryErr != nil {
-			fmt.Printf("[PR-AF] Failed to post review on retry: %v\n", retryErr)
+	body := review.Body + "\n\n### Findings (could not be placed inline)\n\n" + strings.Join(entries, "\n\n")
+	if runes := []rune(body); len(runes) > maxReviewBodyChars {
+		body = string(runes[:maxReviewBodyChars]) + "\n\n_(truncated)_"
+	}
+	return schemas.GitHubReview{Body: body, Event: review.Event, Comments: []schemas.GitHubComment{}}
+}
+
+// postReview posts the review and reports whether GitHub created one.
+//
+// GitHub answers 422 and refuses the WHOLE review when REQUEST_CHANGES targets
+// the caller's own PR, or when one inline comment points to a line it cannot
+// resolve. The first is retried as COMMENT, the second without the inline
+// comments (they move into the body, so no finding is lost). The orchestrator.py
+// twin does the same.
+func (o *Orchestrator) postReview(ctx context.Context, review schemas.GitHubReview, summaryBody string, comments []schemas.GitHubComment) bool {
+	const maxAttempts = 3
+	current := review
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, err := o.deps.GH.PostReview(ctx, o.prData.Owner, o.prData.Repo, o.prData.Number, current, o.prData.HeadSHA)
+		if err == nil {
+			return true
 		}
-		return
+		var apiErr *github.APIError
+		is422 := errors.As(err, &apiErr) && apiErr.StatusCode == 422
+		if !is422 || attempt == maxAttempts-1 {
+			fmt.Printf("[PR-AF] Failed to post review: %v\n", err)
+			return false
+		}
+		switch {
+		case strings.Contains(strings.ToLower(apiErr.Body), "own pull request") && current.Event != "COMMENT":
+			fmt.Println("[PR-AF] Cannot request changes on own PR, retrying with COMMENT event")
+			current = schemas.GitHubReview{Body: summaryBody, Event: "COMMENT", Comments: comments}
+		case len(current.Comments) > 0:
+			fmt.Printf("[PR-AF] GitHub refused the inline comments, retrying with %d finding(s) in the review body\n", len(current.Comments))
+			current = reviewWithoutInlineComments(current)
+		default:
+			fmt.Printf("[PR-AF] Failed to post review: %v\n", err)
+			return false
+		}
 	}
-	fmt.Printf("[PR-AF] Failed to post review: %v\n", err)
+	return false
 }
 
 // ---- path / range helpers ----

@@ -74,6 +74,21 @@ class GitHubReview(BaseModel):
     comments: list[GitHubComment] = Field(default_factory=list)
 
 
+MAX_REVIEW_BODY_CHARS = 60_000  # GitHub refuses a review body over 65,536 characters.
+
+
+def review_without_inline_comments(review: GitHubReview) -> GitHubReview:
+    """The same review with its inline comments written into the body, one `path:line` entry each.
+
+    The fallback when GitHub refuses a review because a comment targets a line outside the diff.
+    """
+    entries = [f"- `{c.path}:{c.line}`\n\n{c.body}" for c in review.comments]
+    body = review.body + "\n\n### Findings (could not be placed inline)\n\n" + "\n\n".join(entries)
+    if len(body) > MAX_REVIEW_BODY_CHARS:
+        body = body[:MAX_REVIEW_BODY_CHARS] + "\n\n_(truncated)_"
+    return GitHubReview(body=body, event=review.event, comments=[])
+
+
 class ReviewResult(BaseModel):
     """The complete output of the PR-AF pipeline."""
 
