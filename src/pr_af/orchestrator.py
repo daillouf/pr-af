@@ -53,6 +53,7 @@ from .schemas.output import (
     ReviewResult,
     ReviewSummary,
     ScoredFinding,
+    review_without_inline_comments,
 )
 from .schemas.pipeline import (
     AdversaryResult,
@@ -336,7 +337,7 @@ class ReviewOrchestrator:
         result = await self._generate_output(scored_findings, intake, anatomy, plan, post_to_github=post)
         print(
             f"[PR-AF] Pipeline complete! {result.summary.total_findings} findings, "
-            f"cost=${result.summary.cost_usd}, posted={post}",
+            f"cost=${result.summary.cost_usd}, posted={getattr(self, 'review_posted', False)}",
             flush=True,
         )
         self._cleanup_context_dir()
@@ -1123,6 +1124,52 @@ class ReviewOrchestrator:
             with contextlib.suppress(OSError):
                 shutil.rmtree(ctx_dir)
 
+    async def _post_review(self, review: GitHubReview) -> bool:
+        """Post the review. True only when GitHub created one.
+
+        GitHub answers 422 and refuses the WHOLE review when one inline comment points to a line
+        it cannot resolve in the diff, or when REQUEST_CHANGES targets the caller's own PR.
+        Each case is retried: the first by downgrading to COMMENT, the second without the inline
+        comments, which move into the review body so no finding is lost.
+        """
+        assert self.pr_data is not None
+        client = GitHubClient()
+        owner, repo, number = self.pr_data.owner, self.pr_data.repo, self.pr_data.number
+        current = review
+        for attempt in range(3):
+            try:
+                await client.post_review(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=number,
+                    review=current,
+                    commit_sha=self.pr_data.head_sha,
+                )
+                print(f"[PR-AF] Posted review to {owner}/{repo}#{number}", flush=True)
+                return True
+            except httpx.HTTPStatusError as exc:
+                is_422 = exc.response.status_code == 422
+                if not is_422 or attempt == 2:
+                    print(f"[PR-AF] Failed to post review: {exc}", flush=True)
+                    return False
+                if "own pull request" in exc.response.text.lower() and current.event != "COMMENT":
+                    print("[PR-AF] Cannot request changes on own PR, retrying with COMMENT event", flush=True)
+                    current = current.model_copy(update={"event": "COMMENT"})
+                elif current.comments:
+                    print(
+                        f"[PR-AF] GitHub refused the inline comments, retrying with {len(current.comments)} "
+                        "finding(s) in the review body",
+                        flush=True,
+                    )
+                    current = review_without_inline_comments(current)
+                else:
+                    print(f"[PR-AF] Failed to post review: {exc}", flush=True)
+                    return False
+            except Exception as exc:
+                print(f"[PR-AF] Failed to post review: {exc}", flush=True)
+                return False
+        return False
+
     async def _generate_output(
         self,
         scored_findings: list[ScoredFinding],
@@ -1217,48 +1264,12 @@ class ReviewOrchestrator:
             comments=comments,
         )
 
+        self.review_posted = False
         if post_to_github and not self.input.dry_run and self.input.pr_url:
-            client = GitHubClient()
-            try:
-                await client.post_review(
-                    owner=self.pr_data.owner,
-                    repo=self.pr_data.repo,
-                    pr_number=self.pr_data.number,
-                    review=review,
-                    commit_sha=self.pr_data.head_sha,
-                )
-                print(
-                    f"[PR-AF] Posted review to {self.pr_data.owner}/{self.pr_data.repo}#{self.pr_data.number}",
-                    flush=True,
-                )
-            except httpx.HTTPStatusError as exc:
-                # GitHub returns 422 when requesting changes on own PR — retry with COMMENT
-                if exc.response.status_code == 422 and "own pull request" in exc.response.text.lower():
-                    print("[PR-AF] Cannot request changes on own PR, retrying with COMMENT event", flush=True)
-                    review_fallback = GitHubReview(
-                        body=summary_body,
-                        event="COMMENT",
-                        comments=comments,
-                    )
-                    try:
-                        await client.post_review(
-                            owner=self.pr_data.owner,
-                            repo=self.pr_data.repo,
-                            pr_number=self.pr_data.number,
-                            review=review_fallback,
-                            commit_sha=self.pr_data.head_sha,
-                        )
-                        print(
-                            f"[PR-AF] Posted review (COMMENT) to "
-                            f"{self.pr_data.owner}/{self.pr_data.repo}#{self.pr_data.number}",
-                            flush=True,
-                        )
-                    except Exception as retry_exc:
-                        print(f"[PR-AF] Failed to post review on retry: {retry_exc}", flush=True)
-                else:
-                    print(f"[PR-AF] Failed to post review: {exc}", flush=True)
-            except Exception as exc:
-                print(f"[PR-AF] Failed to post review: {exc}", flush=True)
+            self.review_posted = await self._post_review(review)
+            if not self.review_posted:
+                # The run still ends 'complete', so name the failure on a line a CI step can grep.
+                print("[PR-AF] REVIEW_NOT_POSTED: no review was created on GitHub", flush=True)
 
         by_severity: dict[str, int] = {}
         for finding in scored_findings:
